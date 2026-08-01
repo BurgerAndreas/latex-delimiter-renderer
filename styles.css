@@ -1,0 +1,19 @@
+.latex-delimiter-renderer-inline {
+  display: inline;
+}
+
+.latex-delimiter-renderer-inline > mjx-container {
+  display: inline-block;
+  margin: 0;
+}
+
+.latex-delimiter-renderer-block {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  text-align: center;
+}
+
+.cm-editor .latex-delimiter-renderer-block {
+  padding: 0.5em 0;
+}
