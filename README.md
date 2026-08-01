@@ -1,6 +1,6 @@
 # LaTeX Delimiter Renderer
 
-An Obsidian plugin that renders standard LaTeX `\(…\)` and `\[…\]` math delimiters alongside Obsidian's native `$…$` and `$$…$$` syntax—without rewriting your Markdown files.
+An Obsidian plugin that renders standard LaTeX `\(…\)` and `\[…\]` math delimiters alongside Obsidian's native `$…$` and `$$…$$` syntax. Automatic and without rewriting your Markdown files.
 
 ## Features
 
