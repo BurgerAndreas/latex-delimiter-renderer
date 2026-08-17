@@ -2,8 +2,6 @@ import {
   editorLivePreviewField,
   finishRenderMath,
   loadMathJax,
-  MarkdownRenderChild,
-  MarkdownRenderer,
   type MarkdownPostProcessorContext,
   Plugin,
   renderMath
@@ -17,7 +15,6 @@ import {
   WidgetType
 } from "@codemirror/view";
 import {
-  convertForObsidianRender,
   findMathDelimiters,
   type MathDelimiterMatch
 } from "./parser";
@@ -33,8 +30,31 @@ function renderFormula(source: string, display: boolean, blockHost = display): H
   return wrapper;
 }
 
+type RenderedCharacter = { node: Text; offset: number };
+
+function renderedCharacters(element: HTMLElement): {
+  text: string;
+  characters: RenderedCharacter[];
+} {
+  let text = "";
+  const characters: RenderedCharacter[] = [];
+
+  function visit(node: Node): void {
+    if (node.instanceOf(Text)) {
+      for (let offset = 0; offset < node.data.length; offset++) {
+        text += node.data[offset];
+        characters.push({ node, offset });
+      }
+      return;
+    }
+    for (const child of Array.from(node.childNodes)) visit(child);
+  }
+
+  visit(element);
+  return { text, characters };
+}
+
 async function renderReadingView(
-  plugin: Plugin,
   element: HTMLElement,
   context: MarkdownPostProcessorContext
 ): Promise<void> {
@@ -42,20 +62,57 @@ async function renderReadingView(
 
   const section = context.getSectionInfo(element);
   if (!section) return;
-  const converted = convertForObsidianRender(section.text);
-  if (converted === section.text) return;
+  const matches = findMathDelimiters(section.text);
+  if (matches.length === 0) return;
+
+  const rendered = renderedCharacters(element);
+  const replacements: Array<{
+    from: number;
+    to: number;
+    match: MathDelimiterMatch;
+  }> = [];
+
+  for (const match of matches) {
+    const opening = match.display ? "[" : "(";
+    const closing = match.display ? "]" : ")";
+    const visibleSource = `${opening}${match.source}${closing}`;
+    let from = rendered.text.indexOf(visibleSource);
+    while (
+      from !== -1 &&
+      replacements.some(
+        (replacement) =>
+          from < replacement.to && from + visibleSource.length > replacement.from
+      )
+    ) {
+      from = rendered.text.indexOf(visibleSource, from + 1);
+    }
+    if (from !== -1) {
+      replacements.push({ from, to: from + visibleSource.length, match });
+    }
+  }
+
+  if (replacements.length === 0) return;
 
   element.setAttribute(READING_RENDER_MARKER, "");
-  element.replaceChildren();
-  const child = new MarkdownRenderChild(element);
-  context.addChild(child);
-  await MarkdownRenderer.render(
-    plugin.app,
-    converted,
-    element,
-    context.sourcePath,
-    child
-  );
+  replacements.sort((left, right) => right.from - left.from);
+  for (const replacement of replacements) {
+    const first = rendered.characters[replacement.from];
+    const last = rendered.characters[replacement.to - 1];
+    if (!first || !last) continue;
+
+    const range = document.createRange();
+    range.setStart(first.node, first.offset);
+    range.setEnd(last.node, last.offset + 1);
+    range.deleteContents();
+    range.insertNode(
+      renderFormula(
+        replacement.match.source,
+        replacement.match.display,
+        replacement.match.display
+      )
+    );
+    range.detach();
+  }
   await finishRenderMath();
 }
 
@@ -309,9 +366,7 @@ export default class LatexDelimiterRenderer extends Plugin {
   async onload(): Promise<void> {
     await loadMathJax();
 
-    this.registerMarkdownPostProcessor((element, context) =>
-      renderReadingView(this, element, context)
-    );
+    this.registerMarkdownPostProcessor(renderReadingView);
     this.registerEditorExtension(livePreviewExtension);
 
     this.app.workspace.onLayoutReady(() => {

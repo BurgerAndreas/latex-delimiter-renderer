@@ -7,6 +7,7 @@ An Obsidian plugin that renders standard LaTeX `\(…\)` and `\[…\]` math deli
 - Renders `\(x + 1\)` as inline math.
 - Renders `\[x + 1\]` as display math, including multiline equations.
 - Works in Live Preview and Reading View.
+- Preserves native heading folding in both views.
 - Reveals the complete original source when a rendered formula is clicked or the cursor enters it.
 - Prevents LaTeX subscripts from leaking Markdown emphasis into surrounding prose.
 - Leaves inline code and fenced code blocks untouched.
@@ -53,7 +54,7 @@ Reload Obsidian, then enable **LaTeX Delimiter Renderer** under Community plugin
 
 - Multiline `\(…\)` expressions remain unrendered because inline editor decorations cannot safely span lines.
 - In Live Preview, multiline `\[…\]` expressions must occupy complete lines.
-- Reading View temporarily re-renders affected Markdown sections in memory. The source file is never modified.
+- Reading View replaces only matched delimiter text in the rendered DOM. The source file is never modified.
 
 ## Privacy and security
 
