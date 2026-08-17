@@ -8,7 +8,8 @@ import {
   Plugin,
   renderMath
 } from "obsidian";
-import { RangeSetBuilder, StateField, type EditorState } from "@codemirror/state";
+import { syntaxTree } from "@codemirror/language";
+import { StateField, type EditorState } from "@codemirror/state";
 import {
   Decoration,
   type DecorationSet,
@@ -104,7 +105,8 @@ class MathWidget extends WidgetType {
   constructor(
     private readonly source: string,
     private readonly display: boolean,
-    private readonly block: boolean
+    private readonly block: boolean,
+    private readonly revealPosition: number
   ) {
     super();
   }
@@ -113,13 +115,45 @@ class MathWidget extends WidgetType {
     return (
       this.source === other.source &&
       this.display === other.display &&
-      this.block === other.block
+      this.block === other.block &&
+      this.revealPosition === other.revealPosition
     );
   }
 
-  toDOM(): HTMLElement {
+  toDOM(view: EditorView): HTMLElement {
     const element = renderFormula(this.source, this.display, this.block);
+    element.addEventListener("mousedown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      view.dispatch({
+        selection: { anchor: this.revealPosition },
+        scrollIntoView: true
+      });
+      view.focus();
+    });
     void finishRenderMath();
+    return element;
+  }
+
+  ignoreEvent(event: Event): boolean {
+    return event.type === "mousedown";
+  }
+}
+
+class LiteralMarkerWidget extends WidgetType {
+  constructor(private readonly marker: string) {
+    super();
+  }
+
+  eq(other: LiteralMarkerWidget): boolean {
+    return this.marker === other.marker;
+  }
+
+  toDOM(): HTMLElement {
+    const element = createSpan();
+    element.className = "latex-delimiter-renderer-source-marker";
+    element.textContent = this.marker;
     return element;
   }
 
@@ -128,19 +162,108 @@ class MathWidget extends WidgetType {
   }
 }
 
+function markdownFormattingMarkersInMath(
+  state: EditorState,
+  match: MathDelimiterMatch
+): Array<{ to: number; text: string }> {
+  const markers: Array<{ to: number; text: string }> = [];
+
+  syntaxTree(state).iterate({
+    from: match.from,
+    to: match.to,
+    enter(node) {
+      if (
+        (node.name.includes("formatting-em") ||
+          node.name.includes("formatting-strong")) &&
+        node.from >= match.from &&
+        node.to <= match.to
+      ) {
+        markers.push({
+          to: node.to,
+          text: state.doc.sliceString(node.from, node.to)
+        });
+      }
+      return true;
+    }
+  });
+
+  return markers;
+}
+
+function emphasisSpillsFromMath(
+  state: EditorState,
+  match: MathDelimiterMatch
+): Array<{ from: number; to: number }> {
+  const spills: Array<{ from: number; to: number }> = [];
+  const textAfterMatch = state.doc.sliceString(match.to);
+  const paragraphBreak = /\n[\t ]*\n/.exec(textAfterMatch);
+  const paragraphEnd = paragraphBreak
+    ? match.to + paragraphBreak.index
+    : state.doc.length;
+  const emphasisMarkers: number[] = [];
+  const strongMarkers: number[] = [];
+
+  syntaxTree(state).iterate({
+    from: match.from,
+    to: paragraphEnd,
+    enter(node) {
+      if (node.name.includes("formatting-em")) emphasisMarkers.push(node.from);
+      if (node.name.includes("formatting-strong")) strongMarkers.push(node.from);
+      return true;
+    }
+  });
+
+  for (const markers of [emphasisMarkers, strongMarkers]) {
+    const markersInsideMath = markers.filter((position) => position < match.to);
+    if (markersInsideMath.length % 2 === 0) continue;
+
+    const closingMarker = markers.find((position) => position >= match.to);
+    const spillEnd = closingMarker ?? paragraphEnd;
+    if (spillEnd > match.to) spills.push({ from: match.to, to: spillEnd });
+  }
+
+  return spills;
+}
+
 function buildLivePreviewDecorations(state: EditorState): DecorationSet {
   if (!state.field(editorLivePreviewField, false)) return Decoration.none;
 
   const text = state.doc.toString();
   const codeRanges = fencedCodeRanges(text);
-  const builder = new RangeSetBuilder<Decoration>();
+  const ranges: ReturnType<Decoration["range"]>[] = [];
 
   for (const match of findMathDelimiters(text)) {
     if (
-      rangeTouchesSelection(state, match) ||
       overlapsRange(match, codeRanges) ||
       isInsideInlineCode(state, match.from)
     ) {
+      continue;
+    }
+
+    for (const spill of emphasisSpillsFromMath(state, match)) {
+      ranges.push(
+        Decoration.mark({ class: "latex-delimiter-renderer-emphasis-spill" }).range(
+          spill.from,
+          spill.to
+        )
+      );
+    }
+
+    if (rangeTouchesSelection(state, match)) {
+      ranges.push(
+        Decoration.mark({ class: "latex-delimiter-renderer-source" }).range(
+          match.from,
+          match.to
+        )
+      );
+      for (const marker of markdownFormattingMarkersInMath(state, match)) {
+        ranges.push(
+          Decoration.widget({
+            widget: new LiteralMarkerWidget(marker.text),
+            side: -1
+          }).range(marker.to)
+        );
+      }
       continue;
     }
 
@@ -152,16 +275,19 @@ function buildLivePreviewDecorations(state: EditorState): DecorationSet {
 
     if (crossesLines && !isWholeLineBlock) continue;
 
-    builder.add(
-      match.from,
-      match.to,
+    ranges.push(
       Decoration.replace({
-        widget: new MathWidget(match.source, match.display, isWholeLineBlock),
+        widget: new MathWidget(
+          match.source,
+          match.display,
+          isWholeLineBlock,
+          match.from + 2
+        ),
         block: isWholeLineBlock
-      })
+      }).range(match.from, match.to)
     );
   }
-  return builder.finish();
+  return Decoration.set(ranges, true);
 }
 
 const livePreviewExtension = StateField.define<DecorationSet>({
