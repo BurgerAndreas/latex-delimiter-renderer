@@ -111,7 +111,6 @@ async function renderReadingView(
         replacement.match.display
       )
     );
-    range.detach();
   }
   await finishRenderMath();
 }
