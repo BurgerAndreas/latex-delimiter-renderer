@@ -75,6 +75,13 @@ npm run check
 
 The production bundle is written to `main.js`.
 
+Release assets include signed GitHub build-provenance attestations. Verify a
+downloaded asset with:
+
+```bash
+gh attestation verify main.js -R BurgerAndreas/latex-delimiter-renderer
+```
+
 ## License
 
 [MIT](LICENSE)

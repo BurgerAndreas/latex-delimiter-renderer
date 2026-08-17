@@ -2,7 +2,7 @@
   display: inline;
 }
 
-.latex-delimiter-renderer-inline > mjx-container {
+.latex-delimiter-renderer-inline > .MathJax {
   display: inline-block;
   margin: 0;
 }
