@@ -2,12 +2,14 @@ import {
   editorLivePreviewField,
   finishRenderMath,
   loadMathJax,
+  MarkdownView,
+  type App,
   type MarkdownPostProcessorContext,
   Plugin,
   renderMath
 } from "obsidian";
 import { syntaxTree } from "@codemirror/language";
-import { StateField, type EditorState } from "@codemirror/state";
+import { Prec, StateField, type EditorState } from "@codemirror/state";
 import {
   Decoration,
   type DecorationSet,
@@ -16,17 +18,44 @@ import {
 } from "@codemirror/view";
 import {
   findMathDelimiters,
+  findTableCellSource,
+  isInsideInlineCodeText,
   type MathDelimiterMatch
 } from "./parser";
 
-const READING_RENDER_MARKER = "data-latex-delimiter-renderer-section";
+const RENDER_MARKER = "data-latex-delimiter-renderer-section";
 
 function renderFormula(source: string, display: boolean, blockHost = display): HTMLElement {
   const wrapper = blockHost ? createDiv() : createSpan();
   wrapper.className = blockHost
     ? "latex-delimiter-renderer latex-delimiter-renderer-block"
     : "latex-delimiter-renderer latex-delimiter-renderer-inline";
-  wrapper.appendChild(renderMath(source, display));
+
+  const render = (): boolean => {
+    try {
+      wrapper.appendChild(renderMath(source, display));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (!render()) {
+    // MathJax can still be starting up when a widget is created. Show the
+    // source instead of throwing (a throwing widget breaks the editor update)
+    // and retry once MathJax reports readiness.
+    const fallback = display ? `\\[${source}\\]` : `\\(${source}\\)`;
+    wrapper.textContent = fallback;
+    void loadMathJax()
+      .then(() => {
+        if (!wrapper.isConnected) return undefined;
+        wrapper.textContent = "";
+        if (render()) return finishRenderMath();
+        wrapper.textContent = fallback;
+        return undefined;
+      })
+      .catch(() => undefined);
+  }
   return wrapper;
 }
 
@@ -54,16 +83,70 @@ function renderedCharacters(element: HTMLElement): {
   return { text, characters };
 }
 
-async function renderReadingView(
-  element: HTMLElement,
-  context: MarkdownPostProcessorContext
-): Promise<void> {
-  if (element.closest(`[${READING_RENDER_MARKER}]`)) return;
+function findOwningEditorView(app: App, element: HTMLElement): EditorView | null {
+  for (const leaf of app.workspace.getLeavesOfType("markdown")) {
+    const view = leaf.view;
+    if (!(view instanceof MarkdownView)) continue;
+    const editorView = (view.editor as unknown as { cm?: EditorView }).cm;
+    if (editorView && editorView.contentDOM.contains(element)) return editorView;
+  }
+  return null;
+}
 
-  const section = context.getSectionInfo(element);
-  if (!section) return;
-  const matches = findMathDelimiters(section.text);
-  if (matches.length === 0) return;
+/**
+ * Live Preview tables are rendered as widgets, and Obsidian runs Markdown post
+ * processors for each table cell without section information. Recover the raw
+ * cell source from the owning editor by mapping the rendered table rows back
+ * to the Markdown table lines.
+ */
+function resolveTableCellSourceText(app: App, element: HTMLElement): string | null {
+  if (!element.classList.contains("table-cell-wrapper")) return null;
+
+  const tableWidget = element.closest(".cm-table-widget");
+  const cell = element.closest("td, th");
+  const table = cell ? cell.closest("table") : null;
+  if (!tableWidget || !cell || !table) return null;
+
+  const editorView = findOwningEditorView(app, element);
+  if (!editorView) return null;
+
+  let tableStart: number;
+  try {
+    tableStart = editorView.posAtDOM(tableWidget);
+  } catch {
+    return null;
+  }
+
+  const row = cell.parentElement;
+  const rows: HTMLElement[] = Array.from(table.querySelectorAll("tr"));
+  const rowIndex = row ? rows.indexOf(row) : -1;
+  const columnIndex = (cell as HTMLTableCellElement).cellIndex;
+  if (rowIndex < 0 || columnIndex < 0) return null;
+
+  const doc = editorView.state.doc;
+  const startLine = doc.lineAt(tableStart);
+  const tableLines: string[] = [];
+  for (let number = startLine.number; number <= doc.lines; number++) {
+    const lineText = doc.line(number).text;
+    if (!lineText.trim().startsWith("|")) break;
+    tableLines.push(lineText);
+  }
+
+  return findTableCellSource(tableLines, rowIndex, columnIndex);
+}
+
+function renderMathInElement(
+  element: HTMLElement,
+  source: string,
+  inlineOnly: boolean
+): boolean {
+  if (element.closest(`[${RENDER_MARKER}]`)) return false;
+
+  let matches = findMathDelimiters(source);
+  if (inlineOnly) {
+    matches = matches.filter((match) => !isInsideInlineCodeText(source, match.from));
+  }
+  if (matches.length === 0) return false;
 
   const rendered = renderedCharacters(element);
   const replacements: Array<{
@@ -91,9 +174,9 @@ async function renderReadingView(
     }
   }
 
-  if (replacements.length === 0) return;
+  if (replacements.length === 0) return false;
 
-  element.setAttribute(READING_RENDER_MARKER, "");
+  element.setAttribute(RENDER_MARKER, "");
   replacements.sort((left, right) => right.from - left.from);
   for (const replacement of replacements) {
     const first = rendered.characters[replacement.from];
@@ -108,11 +191,32 @@ async function renderReadingView(
       renderFormula(
         replacement.match.source,
         replacement.match.display,
-        replacement.match.display
+        inlineOnly ? false : replacement.match.display
       )
     );
   }
-  await finishRenderMath();
+  return true;
+}
+
+async function renderRenderedElement(
+  app: App,
+  element: HTMLElement,
+  context: MarkdownPostProcessorContext
+): Promise<void> {
+  if (element.closest(`[${RENDER_MARKER}]`)) return;
+
+  if (element.classList.contains("table-cell-wrapper")) {
+    const cellSource = resolveTableCellSourceText(app, element);
+    if (cellSource !== null && renderMathInElement(element, cellSource, true)) {
+      await finishRenderMath();
+    }
+    return;
+  }
+
+  const section = context.getSectionInfo(element);
+  if (section && renderMathInElement(element, section.text, false)) {
+    await finishRenderMath();
+  }
 }
 
 function rangeTouchesSelection(state: EditorState, match: MathDelimiterMatch): boolean {
@@ -126,9 +230,7 @@ function rangeTouchesSelection(state: EditorState, match: MathDelimiterMatch): b
 
 function isInsideInlineCode(state: EditorState, position: number): boolean {
   const line = state.doc.lineAt(position);
-  const before = line.text.slice(0, position - line.from);
-  const ticks = before.match(/`+/g) ?? [];
-  return ticks.length % 2 === 1;
+  return isInsideInlineCodeText(line.text, position - line.from);
 }
 
 function fencedCodeRanges(text: string): Array<{ from: number; to: number }> {
@@ -362,14 +464,67 @@ const livePreviewExtension = StateField.define<DecorationSet>({
 });
 
 export default class LatexDelimiterRenderer extends Plugin {
+  private tableRenderTimer: number | null = null;
+
   async onload(): Promise<void> {
     await loadMathJax();
 
-    this.registerMarkdownPostProcessor(renderReadingView);
-    this.registerEditorExtension(livePreviewExtension);
+    this.registerMarkdownPostProcessor((element, context) =>
+      renderRenderedElement(this.app, element, context)
+    );
+    // Obsidian's Live Preview marker decorations cover the same ranges as our
+    // widgets. Without the highest precedence they can replace a formula with
+    // an empty marker widget, which renders as a blank gap until the line is
+    // re-rendered (for example after clicking into it).
+    this.registerEditorExtension(Prec.highest(livePreviewExtension));
 
     this.app.workspace.onLayoutReady(() => {
       this.app.workspace.updateOptions();
+      this.scheduleTableRender();
     });
+    // Tables rendered before this plugin finished loading never reach our post
+    // processor, so refresh the tables that are already on screen.
+    this.registerEvent(
+      this.app.workspace.on("layout-change", () => this.scheduleTableRender())
+    );
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", () => this.scheduleTableRender())
+    );
+  }
+
+  onunload(): void {
+    if (this.tableRenderTimer !== null) {
+      window.clearTimeout(this.tableRenderTimer);
+      this.tableRenderTimer = null;
+    }
+  }
+
+  private scheduleTableRender(): void {
+    if (this.tableRenderTimer !== null) window.clearTimeout(this.tableRenderTimer);
+    this.tableRenderTimer = window.setTimeout(() => {
+      this.tableRenderTimer = null;
+      void this.renderOpenTableCells();
+    }, 150);
+  }
+
+  private async renderOpenTableCells(): Promise<void> {
+    let rendered = false;
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (!(view instanceof MarkdownView)) continue;
+      const editorView = (view.editor as unknown as { cm?: EditorView }).cm;
+      const content = editorView ? editorView.contentDOM : null;
+      if (!content) continue;
+
+      for (const cell of Array.from(
+        content.querySelectorAll<HTMLElement>(".table-cell-wrapper")
+      )) {
+        if (cell.closest(`[${RENDER_MARKER}]`)) continue;
+        const source = resolveTableCellSourceText(this.app, cell);
+        if (source === null) continue;
+        if (renderMathInElement(cell, source, true)) rendered = true;
+      }
+    }
+    if (rendered) await finishRenderMath();
   }
 }
