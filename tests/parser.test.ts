@@ -4,6 +4,7 @@ import {
   convertForObsidianRender,
   findMathDelimiters,
   findTableCellSource,
+  highlightMathSource,
   isInsideInlineCodeText,
   parseTableRow
 } from "../src/parser";
@@ -79,4 +80,31 @@ test("skips math that sits inside inline code", () => {
   assert.equal(matches.length, 2);
   assert.equal(isInsideInlineCodeText(cell, matches[0].from), true);
   assert.equal(isInsideInlineCodeText(cell, matches[1].from), false);
+});
+
+test("highlights LaTeX source with Obsidian math classes", () => {
+  assert.deepEqual(
+    highlightMathSource("x^2 + \\alpha = \\frac{1}{2}").map(
+      (token) => `${token.from}:${token.to}:${token.className}`
+    ),
+    [
+      "0:1:cm-variable-2",
+      "1:2:cm-tag",
+      "2:3:cm-number",
+      "6:12:cm-tag",
+      "15:20:cm-tag",
+      "20:21:cm-bracket",
+      "21:22:cm-number",
+      "22:23:cm-bracket",
+      "23:24:cm-bracket",
+      "24:25:cm-number",
+      "25:26:cm-bracket"
+    ]
+  );
+  assert.deepEqual(highlightMathSource(""), []);
+  assert.deepEqual(highlightMathSource("\\{a\\}"), [
+    { from: 0, to: 2, className: "cm-tag" },
+    { from: 2, to: 3, className: "cm-variable-2" },
+    { from: 3, to: 5, className: "cm-tag" }
+  ]);
 });

@@ -19,6 +19,7 @@ import {
 import {
   findMathDelimiters,
   findTableCellSource,
+  highlightMathSource,
   isInsideInlineCodeText,
   type MathDelimiterMatch
 } from "./parser";
@@ -135,6 +136,58 @@ function resolveTableCellSourceText(app: App, element: HTMLElement): string | nu
   return findTableCellSource(tableLines, rowIndex, columnIndex);
 }
 
+const pendingTableCells = new Set<HTMLElement>();
+let pendingTableCellsTimer: number | null = null;
+
+function processPendingTableCells(app: App, retriesLeft: number): void {
+  const cells = Array.from(pendingTableCells);
+  pendingTableCells.clear();
+  const stillDetached: HTMLElement[] = [];
+  let rendered = false;
+
+  for (const cell of cells) {
+    if (!cell.isConnected) {
+      stillDetached.push(cell);
+      continue;
+    }
+    const source = resolveTableCellSourceText(app, cell);
+    if (source === null) continue;
+    if (renderMathInElement(cell, source, true)) rendered = true;
+  }
+
+  if (rendered) void finishRenderMath();
+
+  if (stillDetached.length > 0 && retriesLeft > 0) {
+    for (const cell of stillDetached) pendingTableCells.add(cell);
+    pendingTableCellsTimer = window.setTimeout(() => {
+      pendingTableCellsTimer = null;
+      processPendingTableCells(app, retriesLeft - 1);
+    }, 50);
+  }
+}
+
+/**
+ * Obsidian renders a Live Preview table widget and runs the cell post
+ * processors before the widget is attached to the editor. The cell source can
+ * only be resolved once the widget is connected, so retry after insertion.
+ */
+function scheduleTableCellProcessing(app: App, element: HTMLElement): void {
+  pendingTableCells.add(element);
+  if (pendingTableCellsTimer !== null) return;
+  pendingTableCellsTimer = window.setTimeout(() => {
+    pendingTableCellsTimer = null;
+    processPendingTableCells(app, 20);
+  }, 0);
+}
+
+function disposePendingTableCells(): void {
+  pendingTableCells.clear();
+  if (pendingTableCellsTimer !== null) {
+    window.clearTimeout(pendingTableCellsTimer);
+    pendingTableCellsTimer = null;
+  }
+}
+
 function renderMathInElement(
   element: HTMLElement,
   source: string,
@@ -206,6 +259,10 @@ async function renderRenderedElement(
   if (element.closest(`[${RENDER_MARKER}]`)) return;
 
   if (element.classList.contains("table-cell-wrapper")) {
+    if (!element.isConnected) {
+      scheduleTableCellProcessing(app, element);
+      return;
+    }
     const cellSource = resolveTableCellSourceText(app, element);
     if (cellSource !== null && renderMathInElement(element, cellSource, true)) {
       await finishRenderMath();
@@ -414,6 +471,31 @@ function buildLivePreviewDecorations(state: EditorState): DecorationSet {
           match.to
         )
       );
+      // Reuse the syntax highlighting Obsidian applies to native `$…$` math,
+      // so the revealed source keeps the same colors and italics.
+      ranges.push(
+        Decoration.mark({ class: "cm-math cm-keyword" }).range(
+          match.from,
+          match.from + 2
+        ),
+        Decoration.mark({ class: "cm-math cm-keyword" }).range(
+          match.to - 2,
+          match.to
+        )
+      );
+      const sourceFrom = match.from + 2;
+      const sourceTo = match.to - 2;
+      if (sourceTo > sourceFrom) {
+        ranges.push(Decoration.mark({ class: "cm-math" }).range(sourceFrom, sourceTo));
+        for (const token of highlightMathSource(match.source)) {
+          ranges.push(
+            Decoration.mark({ class: `cm-math ${token.className}` }).range(
+              sourceFrom + token.from,
+              sourceFrom + token.to
+            )
+          );
+        }
+      }
       for (const marker of markdownFormattingMarkersInMath(state, match)) {
         ranges.push(
           Decoration.widget({
@@ -493,6 +575,7 @@ export default class LatexDelimiterRenderer extends Plugin {
   }
 
   onunload(): void {
+    disposePendingTableCells();
     if (this.tableRenderTimer !== null) {
       window.clearTimeout(this.tableRenderTimer);
       this.tableRenderTimer = null;
