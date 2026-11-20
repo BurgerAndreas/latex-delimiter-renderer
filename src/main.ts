@@ -188,12 +188,22 @@ function disposePendingTableCells(): void {
   }
 }
 
+/**
+ * The marker attribute alone is not proof that formulas are rendered:
+ * Obsidian's preview cache can keep the attribute but drop the inserted
+ * widget DOM. Treat an element as rendered only while it still contains our
+ * widgets, which also keeps MathJax fallback text from being processed twice.
+ */
+function containsRenderedMath(element: HTMLElement): boolean {
+  return element.querySelector(".latex-delimiter-renderer") !== null;
+}
+
 function renderMathInElement(
   element: HTMLElement,
   source: string,
   inlineOnly: boolean
 ): boolean {
-  if (element.closest(`[${RENDER_MARKER}]`)) return false;
+  if (containsRenderedMath(element)) return false;
 
   let matches = findMathDelimiters(source);
   if (inlineOnly) {
@@ -256,7 +266,7 @@ async function renderRenderedElement(
   element: HTMLElement,
   context: MarkdownPostProcessorContext
 ): Promise<void> {
-  if (element.closest(`[${RENDER_MARKER}]`)) return;
+  if (containsRenderedMath(element)) return;
 
   if (element.classList.contains("table-cell-wrapper")) {
     if (!element.isConnected) {
@@ -692,7 +702,7 @@ export default class LatexDelimiterRenderer extends Plugin {
       for (const cell of Array.from(
         content.querySelectorAll<HTMLElement>(".table-cell-wrapper")
       )) {
-        if (cell.closest(`[${RENDER_MARKER}]`)) continue;
+        if (containsRenderedMath(cell)) continue;
         const source = resolveTableCellSourceText(this.app, cell);
         if (source === null) continue;
         if (renderMathInElement(cell, source, true)) rendered = true;
