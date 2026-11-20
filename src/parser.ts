@@ -54,6 +54,131 @@ export function findMathDelimiters(text: string, offset = 0): MathDelimiterMatch
   return matches;
 }
 
+/**
+ * Splits one Markdown table row into trimmed cell sources. Returns null when
+ * the line is not a table row. Escaped pipes (`\|`) stay inside their cell.
+ */
+export function parseTableRow(line: string): string[] | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("|")) return null;
+
+  const cells: string[] = [];
+  let current = "";
+  let closed = false;
+
+  for (let index = 1; index < trimmed.length; index++) {
+    const character = trimmed[index];
+    if (character === "\\" && trimmed[index + 1] === "|") {
+      current += "|";
+      index++;
+      continue;
+    }
+    if (character === "|") {
+      cells.push(current.trim());
+      current = "";
+      closed = index === trimmed.length - 1;
+      continue;
+    }
+    current += character;
+    closed = false;
+  }
+
+  if (!closed) cells.push(current.trim());
+  return cells;
+}
+
+/**
+ * Maps a cell of a rendered table back to its Markdown source cell. The first
+ * source line holds the header, the second line is the delimiter row, and the
+ * remaining lines map one-to-one to the rendered body rows.
+ */
+export function findTableCellSource(
+  tableLines: readonly string[],
+  rowIndex: number,
+  columnIndex: number
+): string | null {
+  if (rowIndex < 0 || columnIndex < 0 || tableLines.length === 0) return null;
+
+  const header = parseTableRow(tableLines[0]);
+  if (!header) return null;
+
+  if (rowIndex === 0) return header[columnIndex] ?? null;
+
+  const sourceRow = tableLines[rowIndex + 1];
+  if (!sourceRow) return null;
+
+  const cells = parseTableRow(sourceRow);
+  return cells ? cells[columnIndex] ?? null : null;
+}
+
+/** True when the given offset in `text` falls inside an inline code span. */
+export function isInsideInlineCodeText(text: string, position: number): boolean {
+  const before = text.slice(0, position);
+  const ticks = before.match(/`+/g) ?? [];
+  return ticks.length % 2 === 1;
+}
+
+export type MathSourceToken = { from: number; to: number; className: string };
+
+function isAsciiLetter(character: string): boolean {
+  return /^[a-zA-Z]$/.test(character);
+}
+
+/**
+ * Splits LaTeX source into runs that Obsidian's Markdown editor highlights
+ * with the same classes it uses for native `$…$` math source.
+ */
+export function highlightMathSource(source: string): MathSourceToken[] {
+  const tokens: MathSourceToken[] = [];
+  let index = 0;
+
+  while (index < source.length) {
+    const character = source[index];
+
+    if (character === "\\") {
+      let end = index + 1;
+      if (end < source.length && isAsciiLetter(source[end])) {
+        while (end < source.length && isAsciiLetter(source[end])) end++;
+      } else if (end < source.length) {
+        end++;
+      }
+      tokens.push({ from: index, to: end, className: "cm-tag" });
+      index = end;
+      continue;
+    }
+
+    if (/[0-9]/.test(character)) {
+      let end = index + 1;
+      while (end < source.length && /[0-9.]/.test(source[end])) end++;
+      tokens.push({ from: index, to: end, className: "cm-number" });
+      index = end;
+      continue;
+    }
+
+    if (isAsciiLetter(character)) {
+      tokens.push({ from: index, to: index + 1, className: "cm-variable-2" });
+      index++;
+      continue;
+    }
+
+    if ("{}()[]".includes(character)) {
+      tokens.push({ from: index, to: index + 1, className: "cm-bracket" });
+      index++;
+      continue;
+    }
+
+    if (character === "^" || character === "_") {
+      tokens.push({ from: index, to: index + 1, className: "cm-tag" });
+      index++;
+      continue;
+    }
+
+    index++;
+  }
+
+  return tokens;
+}
+
 function convertPlainSegment(text: string): string {
   const matches = findMathDelimiters(text);
   if (matches.length === 0) return text;

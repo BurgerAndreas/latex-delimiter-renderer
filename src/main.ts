@@ -2,12 +2,14 @@ import {
   editorLivePreviewField,
   finishRenderMath,
   loadMathJax,
+  MarkdownView,
+  type App,
   type MarkdownPostProcessorContext,
   Plugin,
   renderMath
 } from "obsidian";
 import { syntaxTree } from "@codemirror/language";
-import { StateField, type EditorState } from "@codemirror/state";
+import { Prec, StateField, type EditorState } from "@codemirror/state";
 import {
   Decoration,
   type DecorationSet,
@@ -16,17 +18,45 @@ import {
 } from "@codemirror/view";
 import {
   findMathDelimiters,
+  findTableCellSource,
+  highlightMathSource,
+  isInsideInlineCodeText,
   type MathDelimiterMatch
 } from "./parser";
 
-const READING_RENDER_MARKER = "data-latex-delimiter-renderer-section";
+const RENDER_MARKER = "data-latex-delimiter-renderer-section";
 
 function renderFormula(source: string, display: boolean, blockHost = display): HTMLElement {
   const wrapper = blockHost ? createDiv() : createSpan();
   wrapper.className = blockHost
     ? "latex-delimiter-renderer latex-delimiter-renderer-block"
     : "latex-delimiter-renderer latex-delimiter-renderer-inline";
-  wrapper.appendChild(renderMath(source, display));
+
+  const render = (): boolean => {
+    try {
+      wrapper.appendChild(renderMath(source, display));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (!render()) {
+    // MathJax can still be starting up when a widget is created. Show the
+    // source instead of throwing (a throwing widget breaks the editor update)
+    // and retry once MathJax reports readiness.
+    const fallback = display ? `\\[${source}\\]` : `\\(${source}\\)`;
+    wrapper.textContent = fallback;
+    void loadMathJax()
+      .then(() => {
+        if (!wrapper.isConnected) return undefined;
+        wrapper.textContent = "";
+        if (render()) return finishRenderMath();
+        wrapper.textContent = fallback;
+        return undefined;
+      })
+      .catch(() => undefined);
+  }
   return wrapper;
 }
 
@@ -54,16 +84,132 @@ function renderedCharacters(element: HTMLElement): {
   return { text, characters };
 }
 
-async function renderReadingView(
-  element: HTMLElement,
-  context: MarkdownPostProcessorContext
-): Promise<void> {
-  if (element.closest(`[${READING_RENDER_MARKER}]`)) return;
+function findOwningEditorView(app: App, element: HTMLElement): EditorView | null {
+  for (const leaf of app.workspace.getLeavesOfType("markdown")) {
+    const view = leaf.view;
+    if (!(view instanceof MarkdownView)) continue;
+    const editorView = (view.editor as unknown as { cm?: EditorView }).cm;
+    if (editorView && editorView.contentDOM.contains(element)) return editorView;
+  }
+  return null;
+}
 
-  const section = context.getSectionInfo(element);
-  if (!section) return;
-  const matches = findMathDelimiters(section.text);
-  if (matches.length === 0) return;
+/**
+ * Live Preview tables are rendered as widgets, and Obsidian runs Markdown post
+ * processors for each table cell without section information. Recover the raw
+ * cell source from the owning editor by mapping the rendered table rows back
+ * to the Markdown table lines.
+ */
+function resolveTableCellSourceText(app: App, element: HTMLElement): string | null {
+  if (!element.classList.contains("table-cell-wrapper")) return null;
+
+  const tableWidget = element.closest(".cm-table-widget");
+  const cell = element.closest("td, th");
+  const table = cell ? cell.closest("table") : null;
+  if (!tableWidget || !cell || !table) return null;
+
+  const editorView = findOwningEditorView(app, element);
+  if (!editorView) return null;
+
+  let tableStart: number;
+  try {
+    tableStart = editorView.posAtDOM(tableWidget);
+  } catch {
+    return null;
+  }
+
+  const row = cell.parentElement;
+  const rows: HTMLElement[] = Array.from(table.querySelectorAll("tr"));
+  const rowIndex = row ? rows.indexOf(row) : -1;
+  const columnIndex = (cell as HTMLTableCellElement).cellIndex;
+  if (rowIndex < 0 || columnIndex < 0) return null;
+
+  const doc = editorView.state.doc;
+  const startLine = doc.lineAt(tableStart);
+  const tableLines: string[] = [];
+  for (let number = startLine.number; number <= doc.lines; number++) {
+    const lineText = doc.line(number).text;
+    if (!lineText.trim().startsWith("|")) break;
+    tableLines.push(lineText);
+  }
+
+  return findTableCellSource(tableLines, rowIndex, columnIndex);
+}
+
+const pendingTableCells = new Set<HTMLElement>();
+let pendingTableCellsTimer: number | null = null;
+
+function processPendingTableCells(app: App, retriesLeft: number): void {
+  const cells = Array.from(pendingTableCells);
+  pendingTableCells.clear();
+  const stillDetached: HTMLElement[] = [];
+  let rendered = false;
+
+  for (const cell of cells) {
+    if (!cell.isConnected) {
+      stillDetached.push(cell);
+      continue;
+    }
+    const source = resolveTableCellSourceText(app, cell);
+    if (source === null) continue;
+    if (renderMathInElement(cell, source, true)) rendered = true;
+  }
+
+  if (rendered) void finishRenderMath();
+
+  if (stillDetached.length > 0 && retriesLeft > 0) {
+    for (const cell of stillDetached) pendingTableCells.add(cell);
+    pendingTableCellsTimer = window.setTimeout(() => {
+      pendingTableCellsTimer = null;
+      processPendingTableCells(app, retriesLeft - 1);
+    }, 50);
+  }
+}
+
+/**
+ * Obsidian renders a Live Preview table widget and runs the cell post
+ * processors before the widget is attached to the editor. The cell source can
+ * only be resolved once the widget is connected, so retry after insertion.
+ */
+function scheduleTableCellProcessing(app: App, element: HTMLElement): void {
+  pendingTableCells.add(element);
+  if (pendingTableCellsTimer !== null) return;
+  pendingTableCellsTimer = window.setTimeout(() => {
+    pendingTableCellsTimer = null;
+    processPendingTableCells(app, 20);
+  }, 0);
+}
+
+function disposePendingTableCells(): void {
+  pendingTableCells.clear();
+  if (pendingTableCellsTimer !== null) {
+    window.clearTimeout(pendingTableCellsTimer);
+    pendingTableCellsTimer = null;
+  }
+}
+
+/**
+ * The marker attribute alone is not proof that formulas are rendered:
+ * Obsidian's preview cache can keep the attribute but drop the inserted
+ * widget DOM. Treat an element as rendered only while it still contains our
+ * widgets, which also keeps MathJax fallback text from being processed twice.
+ */
+function containsRenderedMath(element: HTMLElement): boolean {
+  return element.querySelector(".latex-delimiter-renderer") !== null;
+}
+
+function renderMathInElement(
+  element: HTMLElement,
+  source: string,
+  inlineOnly: boolean
+): boolean {
+  if (containsRenderedMath(element)) return false;
+
+  let matches = findMathDelimiters(source);
+  if (inlineOnly) {
+    matches = matches.filter((match) => !isInsideInlineCodeText(source, match.from));
+  }
+  if (matches.length === 0) return false;
 
   const rendered = renderedCharacters(element);
   const replacements: Array<{
@@ -91,9 +237,9 @@ async function renderReadingView(
     }
   }
 
-  if (replacements.length === 0) return;
+  if (replacements.length === 0) return false;
 
-  element.setAttribute(READING_RENDER_MARKER, "");
+  element.setAttribute(RENDER_MARKER, "");
   replacements.sort((left, right) => right.from - left.from);
   for (const replacement of replacements) {
     const first = rendered.characters[replacement.from];
@@ -108,11 +254,36 @@ async function renderReadingView(
       renderFormula(
         replacement.match.source,
         replacement.match.display,
-        replacement.match.display
+        inlineOnly ? false : replacement.match.display
       )
     );
   }
-  await finishRenderMath();
+  return true;
+}
+
+async function renderRenderedElement(
+  app: App,
+  element: HTMLElement,
+  context: MarkdownPostProcessorContext
+): Promise<void> {
+  if (containsRenderedMath(element)) return;
+
+  if (element.classList.contains("table-cell-wrapper")) {
+    if (!element.isConnected) {
+      scheduleTableCellProcessing(app, element);
+      return;
+    }
+    const cellSource = resolveTableCellSourceText(app, element);
+    if (cellSource !== null && renderMathInElement(element, cellSource, true)) {
+      await finishRenderMath();
+    }
+    return;
+  }
+
+  const section = context.getSectionInfo(element);
+  if (section && renderMathInElement(element, section.text, false)) {
+    await finishRenderMath();
+  }
 }
 
 function rangeTouchesSelection(state: EditorState, match: MathDelimiterMatch): boolean {
@@ -126,9 +297,7 @@ function rangeTouchesSelection(state: EditorState, match: MathDelimiterMatch): b
 
 function isInsideInlineCode(state: EditorState, position: number): boolean {
   const line = state.doc.lineAt(position);
-  const before = line.text.slice(0, position - line.from);
-  const ticks = before.match(/`+/g) ?? [];
-  return ticks.length % 2 === 1;
+  return isInsideInlineCodeText(line.text, position - line.from);
 }
 
 function fencedCodeRanges(text: string): Array<{ from: number; to: number }> {
@@ -215,6 +384,68 @@ class LiteralMarkerWidget extends WidgetType {
 
   ignoreEvent(): boolean {
     return false;
+  }
+}
+
+/**
+ * Obsidian's Live Preview treats the backslash of `\[`/`\]` as a Markdown
+ * escape and hides it. Put it back while the source is revealed so the source
+ * matches the file, just like native `$$…$$`.
+ */
+class DelimiterBackslashWidget extends WidgetType {
+  eq(): boolean {
+    return true;
+  }
+
+  toDOM(): HTMLElement {
+    const element = createSpan();
+    element.className = "cm-math cm-keyword";
+    element.textContent = "\\";
+    return element;
+  }
+
+  ignoreEvent(): boolean {
+    return true;
+  }
+}
+
+/**
+ * Rendered preview below display math while its source is being edited,
+ * matching Obsidian's native `$$…$$` Live Preview behavior.
+ */
+class MathPreviewWidget extends WidgetType {
+  constructor(
+    private readonly source: string,
+    private readonly revealPosition: number
+  ) {
+    super();
+  }
+
+  eq(other: MathPreviewWidget): boolean {
+    return (
+      this.source === other.source && this.revealPosition === other.revealPosition
+    );
+  }
+
+  toDOM(view: EditorView): HTMLElement {
+    const element = renderFormula(this.source, true, true);
+    element.classList.add("latex-delimiter-renderer-preview");
+    element.addEventListener("mousedown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      view.dispatch({
+        selection: { anchor: this.revealPosition },
+        scrollIntoView: true
+      });
+      view.focus();
+    });
+    void finishRenderMath();
+    return element;
+  }
+
+  ignoreEvent(event: Event): boolean {
+    return event.type === "mousedown";
   }
 }
 
@@ -305,6 +536,12 @@ function buildLivePreviewDecorations(state: EditorState): DecorationSet {
       );
     }
 
+    const startLine = state.doc.lineAt(match.from);
+    const endLine = state.doc.lineAt(match.to);
+    const crossesLines = startLine.number !== endLine.number;
+    const isWholeLineBlock =
+      match.display && match.from === startLine.from && match.to === endLine.to;
+
     if (rangeTouchesSelection(state, match)) {
       ranges.push(
         Decoration.mark({ class: "latex-delimiter-renderer-source" }).range(
@@ -312,6 +549,59 @@ function buildLivePreviewDecorations(state: EditorState): DecorationSet {
           match.to
         )
       );
+      // Obsidian's Live Preview treats the backslashes of \(…\) and \[…\] as
+      // Markdown escapes and may hide them. Replace them with a literal
+      // backslash so the revealed source always matches the file.
+      ranges.push(
+        Decoration.replace({ widget: new DelimiterBackslashWidget() }).range(
+          match.from,
+          match.from + 1
+        ),
+        Decoration.replace({ widget: new DelimiterBackslashWidget() }).range(
+          match.to - 2,
+          match.to - 1
+        )
+      );
+      // Reuse the syntax highlighting Obsidian applies to native `$…$` math,
+      // so the revealed source keeps the same colors and italics.
+      ranges.push(
+        Decoration.mark({ class: "cm-math cm-keyword" }).range(
+          match.from,
+          match.from + 2
+        ),
+        Decoration.mark({ class: "cm-math cm-keyword" }).range(
+          match.to - 2,
+          match.to
+        )
+      );
+      const sourceFrom = match.from + 2;
+      const sourceTo = match.to - 2;
+      if (sourceTo > sourceFrom) {
+        ranges.push(Decoration.mark({ class: "cm-math" }).range(sourceFrom, sourceTo));
+        for (const token of highlightMathSource(match.source)) {
+          ranges.push(
+            Decoration.mark({ class: `cm-math ${token.className}` }).range(
+              sourceFrom + token.from,
+              sourceFrom + token.to
+            )
+          );
+        }
+      }
+      if (isWholeLineBlock) {
+        // Like native `$$…$$`, keep a rendered preview below the source while
+        // the display block is being edited.
+        const previewPosition =
+          endLine.number < state.doc.lines
+            ? state.doc.line(endLine.number + 1).from
+            : endLine.to;
+        ranges.push(
+          Decoration.widget({
+            widget: new MathPreviewWidget(match.source, match.from + 2),
+            block: true,
+            side: -1
+          }).range(previewPosition)
+        );
+      }
       for (const marker of markdownFormattingMarkersInMath(state, match)) {
         ranges.push(
           Decoration.widget({
@@ -322,12 +612,6 @@ function buildLivePreviewDecorations(state: EditorState): DecorationSet {
       }
       continue;
     }
-
-    const startLine = state.doc.lineAt(match.from);
-    const endLine = state.doc.lineAt(match.to);
-    const crossesLines = startLine.number !== endLine.number;
-    const isWholeLineBlock =
-      match.display && match.from === startLine.from && match.to === endLine.to;
 
     if (crossesLines && !isWholeLineBlock) continue;
 
@@ -362,14 +646,68 @@ const livePreviewExtension = StateField.define<DecorationSet>({
 });
 
 export default class LatexDelimiterRenderer extends Plugin {
+  private tableRenderTimer: number | null = null;
+
   async onload(): Promise<void> {
     await loadMathJax();
 
-    this.registerMarkdownPostProcessor(renderReadingView);
-    this.registerEditorExtension(livePreviewExtension);
+    this.registerMarkdownPostProcessor((element, context) =>
+      renderRenderedElement(this.app, element, context)
+    );
+    // Obsidian's Live Preview marker decorations cover the same ranges as our
+    // widgets. Without the highest precedence they can replace a formula with
+    // an empty marker widget, which renders as a blank gap until the line is
+    // re-rendered (for example after clicking into it).
+    this.registerEditorExtension(Prec.highest(livePreviewExtension));
 
     this.app.workspace.onLayoutReady(() => {
       this.app.workspace.updateOptions();
+      this.scheduleTableRender();
     });
+    // Tables rendered before this plugin finished loading never reach our post
+    // processor, so refresh the tables that are already on screen.
+    this.registerEvent(
+      this.app.workspace.on("layout-change", () => this.scheduleTableRender())
+    );
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", () => this.scheduleTableRender())
+    );
+  }
+
+  onunload(): void {
+    disposePendingTableCells();
+    if (this.tableRenderTimer !== null) {
+      window.clearTimeout(this.tableRenderTimer);
+      this.tableRenderTimer = null;
+    }
+  }
+
+  private scheduleTableRender(): void {
+    if (this.tableRenderTimer !== null) window.clearTimeout(this.tableRenderTimer);
+    this.tableRenderTimer = window.setTimeout(() => {
+      this.tableRenderTimer = null;
+      void this.renderOpenTableCells();
+    }, 150);
+  }
+
+  private async renderOpenTableCells(): Promise<void> {
+    let rendered = false;
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (!(view instanceof MarkdownView)) continue;
+      const editorView = (view.editor as unknown as { cm?: EditorView }).cm;
+      const content = editorView ? editorView.contentDOM : null;
+      if (!content) continue;
+
+      for (const cell of Array.from(
+        content.querySelectorAll<HTMLElement>(".table-cell-wrapper")
+      )) {
+        if (containsRenderedMath(cell)) continue;
+        const source = resolveTableCellSourceText(this.app, cell);
+        if (source === null) continue;
+        if (renderMathInElement(cell, source, true)) rendered = true;
+      }
+    }
+    if (rendered) await finishRenderMath();
   }
 }

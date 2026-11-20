@@ -7,8 +7,10 @@ An Obsidian plugin that renders standard LaTeX `\(…\)` and `\[…\]` math deli
 - Renders `\(x + 1\)` as inline math.
 - Renders `\[x + 1\]` as display math, including multiline equations.
 - Works in Live Preview and Reading View.
+- Renders math inside Live Preview tables, including cached tables.
+- Shows the rendered equation below the source while a `\[…\]` block is being edited, matching Obsidian's `$$…$$` behavior.
 - Preserves native heading folding in both views.
-- Reveals the complete original source when a rendered formula is clicked or the cursor enters it.
+- Reveals the complete original source, with the same LaTeX syntax highlighting as Obsidian's `$…$` source, when a rendered formula is clicked or the cursor enters it.
 - Prevents LaTeX subscripts from leaking Markdown emphasis into surrounding prose.
 - Leaves inline code and fenced code blocks untouched.
 - Uses Obsidian's bundled MathJax renderer and works offline.
