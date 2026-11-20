@@ -377,6 +377,68 @@ class LiteralMarkerWidget extends WidgetType {
   }
 }
 
+/**
+ * Obsidian's Live Preview treats the backslash of `\[`/`\]` as a Markdown
+ * escape and hides it. Put it back while the source is revealed so the source
+ * matches the file, just like native `$$…$$`.
+ */
+class DelimiterBackslashWidget extends WidgetType {
+  eq(): boolean {
+    return true;
+  }
+
+  toDOM(): HTMLElement {
+    const element = createSpan();
+    element.className = "cm-math cm-keyword";
+    element.textContent = "\\";
+    return element;
+  }
+
+  ignoreEvent(): boolean {
+    return true;
+  }
+}
+
+/**
+ * Rendered preview below display math while its source is being edited,
+ * matching Obsidian's native `$$…$$` Live Preview behavior.
+ */
+class MathPreviewWidget extends WidgetType {
+  constructor(
+    private readonly source: string,
+    private readonly revealPosition: number
+  ) {
+    super();
+  }
+
+  eq(other: MathPreviewWidget): boolean {
+    return (
+      this.source === other.source && this.revealPosition === other.revealPosition
+    );
+  }
+
+  toDOM(view: EditorView): HTMLElement {
+    const element = renderFormula(this.source, true, true);
+    element.classList.add("latex-delimiter-renderer-preview");
+    element.addEventListener("mousedown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      view.dispatch({
+        selection: { anchor: this.revealPosition },
+        scrollIntoView: true
+      });
+      view.focus();
+    });
+    void finishRenderMath();
+    return element;
+  }
+
+  ignoreEvent(event: Event): boolean {
+    return event.type === "mousedown";
+  }
+}
+
 function markdownFormattingMarkersInMath(
   state: EditorState,
   match: MathDelimiterMatch
@@ -464,11 +526,30 @@ function buildLivePreviewDecorations(state: EditorState): DecorationSet {
       );
     }
 
+    const startLine = state.doc.lineAt(match.from);
+    const endLine = state.doc.lineAt(match.to);
+    const crossesLines = startLine.number !== endLine.number;
+    const isWholeLineBlock =
+      match.display && match.from === startLine.from && match.to === endLine.to;
+
     if (rangeTouchesSelection(state, match)) {
       ranges.push(
         Decoration.mark({ class: "latex-delimiter-renderer-source" }).range(
           match.from,
           match.to
+        )
+      );
+      // Obsidian's Live Preview treats the backslashes of \(…\) and \[…\] as
+      // Markdown escapes and may hide them. Replace them with a literal
+      // backslash so the revealed source always matches the file.
+      ranges.push(
+        Decoration.replace({ widget: new DelimiterBackslashWidget() }).range(
+          match.from,
+          match.from + 1
+        ),
+        Decoration.replace({ widget: new DelimiterBackslashWidget() }).range(
+          match.to - 2,
+          match.to - 1
         )
       );
       // Reuse the syntax highlighting Obsidian applies to native `$…$` math,
@@ -496,6 +577,21 @@ function buildLivePreviewDecorations(state: EditorState): DecorationSet {
           );
         }
       }
+      if (isWholeLineBlock) {
+        // Like native `$$…$$`, keep a rendered preview below the source while
+        // the display block is being edited.
+        const previewPosition =
+          endLine.number < state.doc.lines
+            ? state.doc.line(endLine.number + 1).from
+            : endLine.to;
+        ranges.push(
+          Decoration.widget({
+            widget: new MathPreviewWidget(match.source, match.from + 2),
+            block: true,
+            side: -1
+          }).range(previewPosition)
+        );
+      }
       for (const marker of markdownFormattingMarkersInMath(state, match)) {
         ranges.push(
           Decoration.widget({
@@ -506,12 +602,6 @@ function buildLivePreviewDecorations(state: EditorState): DecorationSet {
       }
       continue;
     }
-
-    const startLine = state.doc.lineAt(match.from);
-    const endLine = state.doc.lineAt(match.to);
-    const crossesLines = startLine.number !== endLine.number;
-    const isWholeLineBlock =
-      match.display && match.from === startLine.from && match.to === endLine.to;
 
     if (crossesLines && !isWholeLineBlock) continue;
 
